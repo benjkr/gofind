@@ -1,11 +1,12 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
-	Path "path"
-	"sort"
+	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -14,85 +15,140 @@ import (
 )
 
 type File struct {
-	name     string
-	path     string
-	files    map[string]File
-	isFolder bool
-	size     int64
+	name  string
+	path  string
+	size  int64
+	isDir bool
 }
 
-func (f File) Type() string {
-	if f.isFolder {
-		return "d"
+func (f *File) FullPath() string {
+	if f.isDir {
+		return path.Join(f.path, f.name) + string(os.PathSeparator)
 	}
-	return "f"
+	return path.Join(f.path, f.name)
 }
 
-func read_folder(path string, ch chan<- File, depth int) {
-	defer wg.Done()
-	if args.MaxDepth > 0 && depth > args.MaxDepth {
-		return
+func (f *File) Size(pretty bool) string {
+	if pretty {
+		return format_bytes(f.size)
 	}
-	ch <- File{
-		name:     path,
-		path:     path,
-		files:    make(map[string]File),
-		isFolder: true,
-		size:     0,
+	return fmt.Sprintf("%d", f.size)
+}
+
+type FileEntry struct {
+	file  File
+	files []*FileEntry
+	guard sync.Mutex
+}
+
+func make_root_folder() *FileEntry {
+	return &FileEntry{
+		file: File{
+			name:  args.Folder,
+			path:  args.Folder,
+			isDir: true,
+			size:  0,
+		},
+		files: make([]*FileEntry, 0),
+		guard: sync.Mutex{},
+	}
+}
+
+func (f *FileEntry) ToSlice(include_dirs bool) []*File {
+	var files []*File
+	if !f.IsDir() || include_dirs {
+		files = append(files, &f.file)
 	}
 
-	files, err := os.ReadDir(path)
-	if err != nil {
-		panic(err)
+	if f.IsDir() {
+		for _, file_entry := range f.files {
+			files = append(files, file_entry.ToSlice(include_dirs)...)
+		}
 	}
-	for _, file := range files {
-		if file.IsDir() {
-			wg.Add(1)
-			go read_folder(Path.Join(path, file.Name()), ch, depth+1)
-		} else {
-			if stat, err := os.Stat(Path.Join(path, file.Name())); err == nil {
-				ch <- File{
-					name:     file.Name(),
-					path:     path,
-					files:    nil,
-					isFolder: false,
-					size:     stat.Size(),
-				}
+	return files
+}
+
+func (f *FileEntry) IsDir() bool {
+	return f.file.isDir
+}
+
+func (f *FileEntry) Sort(inverted bool) {
+	if f.IsDir() {
+		slices.SortFunc(f.files, func(i, j *FileEntry) int {
+			if inverted {
+				return int(i.file.size - j.file.size)
 			}
+			return int(j.file.size - i.file.size)
+		})
+		for _, inner_f := range f.files {
+			inner_f.Sort(inverted)
 		}
 	}
 }
 
-func handle_files(ctx context.Context, files_ch chan File, files map[string]File) {
-	for {
-		select {
-		case file := <-files_ch:
-			if file.isFolder {
-				files[file.path] = file
-			} else {
-				files[Path.Join(file.path, file.name)] = file
+func (f *FileEntry) CalculateSize() int64 {
+	if f.IsDir() {
+		for _, inner_f := range f.files {
+			f.file.size += inner_f.CalculateSize()
+		}
+	}
 
-				relative_path := strings.TrimPrefix(file.path, args.Folder)
-				if relative_path != "" {
-					for dir, _file := Path.Split(relative_path); dir != "" && _file != ""; dir, _file = Path.Split(dir) {
-						en := files[Path.Join(args.Folder, dir)]
-						en.size += file.size
-						files[Path.Join(args.Folder, dir)] = en
-					}
-				}
+	return f.file.size
+}
 
-				dir := files[file.path]
-				dir.size += file.size
-				files[file.path] = dir
+func (f *FileEntry) ToTree(ident int, pretty bool) string {
+	var buf bytes.Buffer
+	size := fmt.Sprintf("%d", f.file.size)
+	if pretty {
+		size = format_bytes(f.file.size)
+	}
+	buf.WriteString(fmt.Sprintf("%s├── %s (%s)\n", strings.Repeat("│   ", ident), f.file.name, size))
 
-				// Add to root folder
-				dir = files[args.Folder]
-				dir.size += file.size
-				files[args.Folder] = dir
+	if f.IsDir() {
+		for _, f := range f.files {
+			buf.WriteString(f.ToTree(ident+1, pretty))
+		}
+	}
+	return buf.String()
+}
+
+func read_folder(folder_path string, folder *FileEntry, depth int, max_depth int, include_hidden bool) {
+	defer wg.Done()
+	if max_depth > 0 && depth > max_depth {
+		return
+	}
+
+	files, err := os.ReadDir(folder_path)
+	if err != nil {
+		panic(err)
+	}
+	for _, file := range files {
+		if !include_hidden && strings.HasPrefix(file.Name(), ".") {
+			continue
+		}
+
+		folder_entry := &FileEntry{
+			file: File{
+				name:  file.Name(),
+				path:  folder_path,
+				isDir: file.IsDir(),
+			},
+			guard: sync.Mutex{},
+		}
+		if folder_entry.IsDir() {
+			folder.guard.Lock()
+			folder.files = append(folder.files, folder_entry)
+			folder.guard.Unlock()
+
+			wg.Add(1)
+			go read_folder(folder_entry.file.FullPath(), folder_entry, depth+1, max_depth, include_hidden)
+		} else {
+			if stat, err := file.Info(); err == nil {
+				folder.guard.Lock()
+				folder_entry.file.size = stat.Size()
+				folder.files = append(folder.files, folder_entry)
+				folder.guard.Unlock()
 			}
-		case <-ctx.Done():
-			wg.Done()
-			return
 		}
 	}
 }
@@ -100,7 +156,7 @@ func handle_files(ctx context.Context, files_ch chan File, files map[string]File
 func format_bytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
-		return fmt.Sprintf("%dB", bytes)
+		return fmt.Sprintf("%d", bytes)
 	}
 	div, exp := int64(unit), 0
 	for n := bytes / unit; n >= unit; n /= unit {
@@ -115,11 +171,13 @@ var wg sync.WaitGroup = sync.WaitGroup{}
 
 var args struct {
 	Inverted      bool   `arg:"-i,--inverted" help:"inverted sort" default:"false"`
-	MaxDepth      int    `arg:"--depth" help:"max depth to go (0 = infinite)" default:"10"`
-	Top           int    `arg:"--top" help:"N Top files" default:"10"`
+	MaxDepth      int    `arg:"--depth" help:"max depth to go (0 = infinite)" default:"0"`
+	All           bool   `arg:"-a,--all" help:"do not ignore entries starting with ."`
+	Tree          bool   `arg:"-t,--tree" help:"Prints Tree of all indexed files"`
+	Top           int    `arg:"--top" help:"N Top files" default:"0"`
 	IncludeDirs   bool   `arg:"-d,--dirs" help:"include directories" default:"false"`
 	HumanReadable bool   `arg:"-H, --" help:"human readable sizes" default:"false"`
-	Quiet         bool   `arg:"-q, --" help:"quiet mode" default:"false"`
+	Verbose       bool   `arg:"-v, --verbose" help:"verbose mode" default:"false"`
 	Folder        string `arg:"positional,required"`
 }
 
@@ -127,63 +185,42 @@ func main() {
 	start_time := time.Now()
 	arg.MustParse(&args)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	files := make(map[string]File)
-	files_ch := make(chan File)
-	wg.Add(1)
+	if stat, err := os.Stat(args.Folder); errors.Is(err, os.ErrNotExist) || !stat.IsDir() {
+		fmt.Printf("Folder path specified '%s' does not exists OR is not a directory.\n", args.Folder)
+		os.Exit(1)
+	}
 
-	go read_folder(args.Folder, files_ch, 1)
-	go handle_files(ctx, files_ch, files)
+	root := make_root_folder()
+
+	wg.Add(1)
+	go read_folder(args.Folder, root, 1, args.MaxDepth, args.All)
 
 	wg.Wait()
-	wg.Add(1)
-	cancel()
-	wg.Wait()
 
-	n_files := 0
-	n_folders := 0
-	sorted_files := make([]File, 0)
-	for _, file := range files {
-		if file.isFolder {
-			n_folders++
-		} else {
-			n_files++
-		}
+	root.CalculateSize()
+	if args.Tree {
+		root.Sort(args.Inverted)
+		fmt.Println(root.ToTree(0, args.HumanReadable))
+	} else {
+		files := root.ToSlice(args.IncludeDirs)
+		slices.SortFunc(files, func(a, b *File) int {
+			if args.Inverted {
+				return int(a.size - b.size)
+			} else {
+				return int(b.size - a.size)
+			}
+		})
 
-		if !file.isFolder || args.IncludeDirs {
-			sorted_files = append(sorted_files, file)
+		for i, f := range files {
+			if args.Top > 0 && i >= args.Top {
+				break
+			}
+
+			fmt.Printf("%-*s %s\n", 12, f.Size(args.HumanReadable), f.FullPath())
 		}
 	}
-	sort.SliceStable(sorted_files, func(i, j int) bool {
-		if args.Inverted {
-			return sorted_files[i].size < sorted_files[j].size
-		} else {
-			return sorted_files[i].size > sorted_files[j].size
-		}
-	})
 
-	N := 8
-	for i, file := range sorted_files {
-		if i >= args.Top {
-			break
-		}
-		size := ""
-		if args.HumanReadable {
-			size = format_bytes(file.size)
-		} else {
-			size = fmt.Sprintf("%d", file.size)
-			N = max(N, len(size))
-		}
-		name := Path.Join(file.path, file.name)
-		if file.isFolder {
-			name = file.path
-		}
-
-		fmt.Printf("%-*s %s %s\n", N, size, file.Type(), name)
-	}
-	if !args.Quiet {
-		fmt.Printf("%s\n", strings.Repeat("-", 20))
-		fmt.Printf("%d folders | %d files\n", n_folders, n_files)
-		fmt.Printf("Took %s\n", time.Since(start_time))
+	if args.Verbose {
+		fmt.Printf("##Took %s\n", time.Since(start_time))
 	}
 }
