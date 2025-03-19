@@ -68,6 +68,20 @@ func (f *FileEntry) ToSlice(include_dirs bool) []*File {
 	return files
 }
 
+func (f *FileEntry) Length(include_dirs bool) int {
+	var length int
+	if !f.IsDir() || include_dirs {
+		length += 1
+	}
+
+	if f.IsDir() {
+		for _, file_entry := range f.files {
+			length += file_entry.Length(include_dirs)
+		}
+	}
+	return length
+}
+
 func (f *FileEntry) IsDir() bool {
 	return f.file.isDir
 }
@@ -194,14 +208,25 @@ func main() {
 
 	wg.Add(1)
 	go read_folder(args.Folder, root, 1, args.MaxDepth, args.All)
-
 	wg.Wait()
-
 	root.CalculateSize()
+	index_duration := time.Since(start_time)
+
+	var sorting_time time.Duration
+	var printing_time time.Duration
+	var file_count int
 	if args.Tree {
+		start_sorting := time.Now()
 		root.Sort(args.Inverted)
+		sorting_time = time.Since(start_sorting)
+
+		start_printing := time.Now()
 		fmt.Println(root.ToTree(0, args.HumanReadable))
+		printing_time = time.Since(start_printing)
+
+		file_count = root.Length(args.IncludeDirs)
 	} else {
+		start_sorting := time.Now()
 		files := root.ToSlice(args.IncludeDirs)
 		slices.SortFunc(files, func(a, b *File) int {
 			if args.Inverted {
@@ -210,7 +235,9 @@ func main() {
 				return int(b.size - a.size)
 			}
 		})
+		sorting_time = time.Since(start_sorting)
 
+		start_printing := time.Now()
 		for i, f := range files {
 			if args.Top > 0 && i >= args.Top {
 				break
@@ -218,9 +245,15 @@ func main() {
 
 			fmt.Printf("%-*s %s\n", 12, f.Size(args.HumanReadable), f.FullPath())
 		}
+		printing_time = time.Since(start_printing)
+		file_count = len(files)
 	}
 
 	if args.Verbose {
-		fmt.Printf("##Took %s\n", time.Since(start_time))
+		fmt.Printf("## File Count %d\n", file_count)
+		fmt.Printf("## Sorting Time %s\n", sorting_time)
+		fmt.Printf("## Printing Time %s\n", printing_time)
+		fmt.Printf("## Index Time %s\n", index_duration)
+		fmt.Printf("## Total Times %s\n", time.Since(start_time))
 	}
 }
